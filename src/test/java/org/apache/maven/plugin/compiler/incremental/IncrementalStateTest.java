@@ -43,11 +43,19 @@ class IncrementalStateTest {
         state.setSourceHash("src/Service.java", "hash2");
         state.setType(
                 "com.Model",
-                new IncrementalState.TypeInfo("src/Model.java", Set.of(), Set.of("com.MyAnnotation"), ""));
+                new IncrementalState.AbiTypeInfo(
+                        "src/Model.java", Set.of(), Set.of("com.MyAnnotation"), "", Set.of(), Set.of(), "abi1"));
         state.setType(
                 "com.Service",
-                new IncrementalState.TypeInfo(
-                        "src/Service.java", Set.of("com.Model", "com.Helper"), Set.of(), ""));
+                new IncrementalState.AbiTypeInfo(
+                        "src/Service.java",
+                        Set.of("com.Model", "com.Helper"),
+                        Set.of(),
+                        "",
+                        Set.of("com.Model"),
+                        Set.of("com.Helper"),
+                        "abi2"));
+        state.setExternalFingerprints(Map.of("ext.Lib", "extfp1"));
         state.setClasspathIdentities(Map.of("/path/to/lib.jar", "1234:5678"));
         return state;
     }
@@ -62,16 +70,21 @@ class IncrementalStateTest {
         assertNotNull(loaded);
         assertEquals("hash1", loaded.getSourceHash("src/Model.java"));
         assertEquals("hash2", loaded.getSourceHash("src/Service.java"));
+        assertEquals("abi1", loaded.getAbiFingerprint("com.Model"));
+        assertEquals("abi2", loaded.getAbiFingerprint("com.Service"));
 
         var serviceInfo = loaded.getType("com.Service");
         assertNotNull(serviceInfo);
-        assertTrue(serviceInfo.classDeps().contains("com.Model"));
-        assertTrue(serviceInfo.classDeps().contains("com.Helper"));
+        assertTrue(serviceInfo instanceof IncrementalState.AbiTypeInfo);
+        var abiService = (IncrementalState.AbiTypeInfo) serviceInfo;
+        assertTrue(abiService.signatureDeps().contains("com.Model"));
+        assertTrue(abiService.implementationDeps().contains("com.Helper"));
 
         var modelInfo = loaded.getType("com.Model");
         assertNotNull(modelInfo);
         assertTrue(modelInfo.annotationTypes().contains("com.MyAnnotation"));
 
+        assertEquals("extfp1", loaded.getExternalFingerprints().get("ext.Lib"));
         assertEquals("1234:5678", loaded.getClasspathIdentities().get("/path/to/lib.jar"));
     }
 
@@ -124,20 +137,20 @@ class IncrementalStateTest {
     void getExternalDependencies() {
         var state = createPopulatedState();
         Set<String> external = state.getExternalDependencies();
-        // com.Helper is a dep of com.Service but has no TypeInfo entry
-        assertTrue(external.contains("com.Helper"), "should include deps without TypeInfo");
-        // com.Model is a dep of com.Service and has a TypeInfo entry
+        // com.Helper is an impl dep of com.Service but has no TypeInfo entry
+        assertTrue(external.contains("com.Helper"), "should include impl deps without TypeInfo");
+        // com.Model is a sig dep of com.Service but has a TypeInfo entry
         assertTrue(!external.contains("com.Model"), "should not include types with TypeInfo");
     }
 
     @Test
-    void getConsumersReturnsCorrectSet() {
+    void getAllConsumersReturnsBothSigAndImpl() {
         var state = createPopulatedState();
-        Set<String> consumers = state.getConsumers("com.Model");
-        assertTrue(consumers.contains("com.Service"), "Service depends on Model");
+        Set<String> consumers = state.getAllConsumers("com.Model");
+        assertTrue(consumers.contains("com.Service"), "Service has Model as sig dep");
 
-        Set<String> helperConsumers = state.getConsumers("com.Helper");
-        assertTrue(helperConsumers.contains("com.Service"), "Service depends on Helper");
+        Set<String> helperConsumers = state.getAllConsumers("com.Helper");
+        assertTrue(helperConsumers.contains("com.Service"), "Service has Helper as impl dep");
     }
 
     @Test
@@ -146,10 +159,21 @@ class IncrementalStateTest {
         var copy = original.copy();
 
         copy.setSourceHash("src/Extra.java", "hash3");
-        copy.setType("com.Extra", new IncrementalState.TypeInfo("src/Extra.java", Set.of(), Set.of(), ""));
+        copy.setType(
+                "com.Extra",
+                new IncrementalState.AbiTypeInfo("src/Extra.java", Set.of(), Set.of(), "", Set.of(), Set.of(), "abi3"));
 
         assertNull(original.getSourceHash("src/Extra.java"), "original should not be affected");
         assertNull(original.getType("com.Extra"), "original should not be affected");
+    }
+
+    @Test
+    void getAllAbiFingerprints() {
+        var state = createPopulatedState();
+        Map<String, String> fingerprints = state.getAllAbiFingerprints();
+        assertEquals("abi1", fingerprints.get("com.Model"));
+        assertEquals("abi2", fingerprints.get("com.Service"));
+        assertEquals(2, fingerprints.size());
     }
 
     @Test

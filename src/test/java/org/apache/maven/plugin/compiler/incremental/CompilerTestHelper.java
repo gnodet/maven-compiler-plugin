@@ -76,6 +76,10 @@ class CompilerTestHelper {
                                     analysis.className(),
                                     sf.toString(),
                                     unionDeps(analysis.signatureTypes(), analysis.implementationTypes()),
+                                    analysis.signatureTypes(),
+                                    analysis.implementationTypes(),
+                                    analysis.abiFingerprint(),
+                                    analysis.abiCanonical(),
                                     analysis.annotationTypes(),
                                     analysis.moduleName());
                             results.put(analysis.className(), sfa);

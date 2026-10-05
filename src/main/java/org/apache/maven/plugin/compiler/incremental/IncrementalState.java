@@ -34,45 +34,125 @@ import java.util.Set;
 import java.util.TreeSet;
 
 /**
- * Persistent state for the {@code graph} incremental compilation strategy.
+ * Persistent state for incremental compilation, storing per-source-file content
+ * hashes and per-type metadata.
  *
- * <p>Stores per-source-file content hashes and per-type dependency metadata.
- * Each compiled type is represented as a {@link TypeInfo} record containing
- * all class-level references found in the classfile constant pool.
+ * <p>Two levels of type metadata are supported, corresponding to the two incremental
+ * strategies:
+ * <ul>
+ *   <li>{@link GraphTypeInfo} — used by the {@code graph} strategy. Stores class-level
+ *       dependency references (all types referenced in the classfile constant pool), without
+ *       distinguishing signature from implementation dependencies, and without ABI fingerprints.</li>
+ *   <li>{@link AbiTypeInfo} — used by the {@code abi} strategy. Extends {@code GraphTypeInfo}
+ *       with fine-grained {@code signatureDeps}/{@code implementationDeps} sets and an ABI
+ *       fingerprint, enabling more precise cascade decisions and cross-module manifest writing.</li>
+ * </ul>
  *
- * <p>Serialized as a compact binary format via {@link DataOutputStream} and stored
- * alongside the class output as {@code .incremental-state}.
+ * <p>Serialized as a compact binary format via {@link DataOutputStream} and stored alongside
+ * the class output as {@code .incremental-state}. A one-byte tag discriminates the two
+ * {@code TypeInfo} variants: {@code 0} = {@code GraphTypeInfo}, {@code 1} = {@code AbiTypeInfo}.
+ *
+ * <p>Consumer lookup methods ({@link #getSignatureConsumers}, {@link #getImplementationConsumers},
+ * {@link #getAllConsumers}) support the cascade logic. For {@code GraphTypeInfo}, all consumers
+ * are stored as "signature consumers" (single index, no distinction). For {@code AbiTypeInfo},
+ * signature and implementation consumers are indexed separately.
  *
  * @see GraphIncrementalBuild
  */
 public class IncrementalState {
 
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
+
+    /** Serialization tag for {@link GraphTypeInfo}. */
+    private static final byte TAG_GRAPH = 0;
+
+    /** Serialization tag for {@link AbiTypeInfo}. */
+    private static final byte TAG_ABI = 1;
 
     private final Map<String, String> sourceHashes = new LinkedHashMap<>();
     private final Map<String, Long> sourceMtimes = new LinkedHashMap<>();
     private final Map<String, TypeInfo> types = new LinkedHashMap<>();
     private final Map<String, String> externalFingerprints = new LinkedHashMap<>();
     private final Map<String, String> classpathIdentities = new LinkedHashMap<>();
-    /** Maps each dependency type to the set of types that reference it. */
-    private final Map<String, Set<String>> consumersIndex = new LinkedHashMap<>();
+    /**
+     * For {@link GraphTypeInfo}: stores all consumers (no sig/impl distinction).
+     * For {@link AbiTypeInfo}: stores only signature consumers.
+     */
+    private final Map<String, Set<String>> signatureConsumersIndex = new LinkedHashMap<>();
+    /** Only populated for {@link AbiTypeInfo} entries. */
+    private final Map<String, Set<String>> implementationConsumersIndex = new LinkedHashMap<>();
     private final Map<String, Set<String>> sourceToTypesIndex = new LinkedHashMap<>();
     private String configHash = "";
 
     // -----------------------------------------------------------------------
-    // TypeInfo
+    // TypeInfo sealed hierarchy
     // -----------------------------------------------------------------------
 
     /**
-     * Per-type metadata stored by the {@code graph} incremental engine.
+     * Per-type metadata stored by the incremental engine.
      *
-     * @param sourceFile      path to the source file that defines this type
-     * @param classDeps       all types referenced in the classfile (constant pool class entries),
-     *                        regardless of where the reference appears
-     * @param annotationTypes annotation types applied to this type or its members
-     * @param moduleName      Java module name (empty string if non-modular or unnamed)
+     * <p>Use {@code switch} on the concrete type to distinguish the two strategies:
+     * <pre>{@code
+     * switch (info) {
+     *     case GraphTypeInfo g -> // class-level deps only
+     *     case AbiTypeInfo  a -> // fine-grained sig/impl deps + ABI fingerprint
+     * }
+     * }</pre>
      */
-    public record TypeInfo(String sourceFile, Set<String> classDeps, Set<String> annotationTypes, String moduleName) {}
+    public sealed interface TypeInfo permits GraphTypeInfo, AbiTypeInfo {
+        /** Path to the source file that defines this type. */
+        String sourceFile();
+
+        /** All class-level dependency references (constant pool {@code ClassEntry} names). */
+        Set<String> classDeps();
+
+        /** Annotation types applied to this type or its members. */
+        Set<String> annotationTypes();
+
+        /** Java module name, or empty string if non-modular or unnamed module. */
+        String moduleName();
+    }
+
+    /**
+     * Type metadata for the {@code graph} incremental strategy.
+     *
+     * <p>Stores all class-level references without distinguishing public API (signature)
+     * from method-body references (implementation). No ABI fingerprint is computed.
+     *
+     * @param sourceFile     path to the source file that defines this type
+     * @param classDeps      all types referenced in the classfile (constant pool class entries),
+     *                       regardless of where the reference appears
+     * @param annotationTypes annotation types applied to this type or its members
+     * @param moduleName     Java module name (empty string if non-modular or unnamed)
+     */
+    public record GraphTypeInfo(String sourceFile, Set<String> classDeps, Set<String> annotationTypes, String moduleName)
+            implements TypeInfo {}
+
+    /**
+     * Type metadata for the {@code abi} incremental strategy.
+     *
+     * <p>Extends {@link GraphTypeInfo} with fine-grained dependency sets and an ABI fingerprint,
+     * enabling more precise cascade decisions (only signature consumers cascade transitively)
+     * and cross-module incremental detection via {@link AbiManifest}.
+     *
+     * @param sourceFile         path to the source file that defines this type
+     * @param classDeps          all types referenced in the classfile (union of sig + impl deps)
+     * @param annotationTypes    annotation types applied to this type or its members
+     * @param moduleName         Java module name (empty string if non-modular or unnamed)
+     * @param signatureDeps      types in the public API surface (extends/implements, method/field
+     *                           descriptors of non-private members, exception types, annotations)
+     * @param implementationDeps types referenced only in method bodies or private members
+     * @param abiFingerprint     16-character hex SHA-256 prefix of the ABI canonical form
+     */
+    public record AbiTypeInfo(
+            String sourceFile,
+            Set<String> classDeps,
+            Set<String> annotationTypes,
+            String moduleName,
+            Set<String> signatureDeps,
+            Set<String> implementationDeps,
+            String abiFingerprint)
+            implements TypeInfo {}
 
     // -----------------------------------------------------------------------
     // Source hash accessors
@@ -116,6 +196,15 @@ public class IncrementalState {
         return Collections.unmodifiableMap(types);
     }
 
+    /**
+     * Returns the ABI fingerprint for the given type, or {@code null} if the type
+     * is not stored with {@link AbiTypeInfo} (i.e. the {@code graph} strategy is in use).
+     */
+    public String getAbiFingerprint(String qualifiedName) {
+        TypeInfo info = types.get(qualifiedName);
+        return info instanceof AbiTypeInfo abi ? abi.abiFingerprint() : null;
+    }
+
     public void setType(String qualifiedName, TypeInfo info) {
         TypeInfo old = types.put(qualifiedName, info);
         updateInvertedIndex(qualifiedName, old, info);
@@ -157,10 +246,33 @@ public class IncrementalState {
     // -----------------------------------------------------------------------
 
     /**
-     * Returns the set of types that reference {@code type} in their dependency set.
+     * Returns the set of types that have {@code type} in their signature dependencies.
+     *
+     * <p>For the {@code graph} strategy ({@link GraphTypeInfo}), this returns all consumers
+     * (no sig/impl distinction is made). For the {@code abi} strategy ({@link AbiTypeInfo}),
+     * this returns only signature consumers (those that cascade transitively).
      */
-    public Set<String> getConsumers(String type) {
-        return Collections.unmodifiableSet(consumersIndex.getOrDefault(type, Collections.emptySet()));
+    public Set<String> getSignatureConsumers(String type) {
+        return Collections.unmodifiableSet(signatureConsumersIndex.getOrDefault(type, Collections.emptySet()));
+    }
+
+    /**
+     * Returns the set of types that have {@code type} in their implementation dependencies only.
+     *
+     * <p>Only populated for the {@code abi} strategy ({@link AbiTypeInfo}). Always empty for
+     * the {@code graph} strategy.
+     */
+    public Set<String> getImplementationConsumers(String type) {
+        return Collections.unmodifiableSet(implementationConsumersIndex.getOrDefault(type, Collections.emptySet()));
+    }
+
+    /**
+     * Returns all consumers of {@code type} (union of signature and implementation consumers).
+     */
+    public Set<String> getAllConsumers(String type) {
+        var result = new TreeSet<>(getSignatureConsumers(type));
+        result.addAll(getImplementationConsumers(type));
+        return result;
     }
 
     // -----------------------------------------------------------------------
@@ -232,6 +344,8 @@ public class IncrementalState {
      * Returns the set of type names that appear in dependency sets but are not
      * defined in this module (no {@link TypeInfo} entry). These are types from
      * the classpath — other reactor modules or external libraries.
+     *
+     * <p>Uses {@link TypeInfo#classDeps()} which is available for both strategies.
      */
     public Set<String> getExternalDependencies() {
         var external = new TreeSet<String>();
@@ -243,6 +357,23 @@ public class IncrementalState {
             }
         }
         return external;
+    }
+
+    /**
+     * Returns the current ABI fingerprints for all types stored as {@link AbiTypeInfo},
+     * suitable for writing to an {@link AbiManifest}.
+     *
+     * <p>Types stored as {@link GraphTypeInfo} (i.e. compiled with the {@code graph} strategy)
+     * are not included — they have no ABI fingerprint.
+     */
+    public Map<String, String> getAllAbiFingerprints() {
+        var result = new LinkedHashMap<String, String>();
+        for (var entry : types.entrySet()) {
+            if (entry.getValue() instanceof AbiTypeInfo abi) {
+                result.put(entry.getKey(), abi.abiFingerprint());
+            }
+        }
+        return result;
     }
 
     // -----------------------------------------------------------------------
@@ -266,19 +397,32 @@ public class IncrementalState {
     // -----------------------------------------------------------------------
 
     private void buildInvertedIndex() {
-        consumersIndex.clear();
+        signatureConsumersIndex.clear();
+        implementationConsumersIndex.clear();
         sourceToTypesIndex.clear();
         for (var entry : types.entrySet()) {
-            indexDepsFor(entry.getKey(), entry.getValue());
+            String consumer = entry.getKey();
+            TypeInfo info = entry.getValue();
+            indexDepsFor(consumer, null, info);
         }
     }
 
     private void updateInvertedIndex(String typeName, TypeInfo oldInfo, TypeInfo newInfo) {
+        // Remove old entries
         if (oldInfo != null) {
-            for (String dep : oldInfo.classDeps()) {
-                Set<String> consumers = consumersIndex.get(dep);
+            Set<String> deps = depsForIndex(oldInfo);
+            for (String dep : deps) {
+                Set<String> consumers = signatureConsumersIndex.get(dep);
                 if (consumers != null) {
                     consumers.remove(typeName);
+                }
+            }
+            if (oldInfo instanceof AbiTypeInfo oldAbi) {
+                for (String dep : oldAbi.implementationDeps()) {
+                    Set<String> consumers = implementationConsumersIndex.get(dep);
+                    if (consumers != null) {
+                        consumers.remove(typeName);
+                    }
                 }
             }
             Set<String> oldSources = sourceToTypesIndex.get(oldInfo.sourceFile());
@@ -286,17 +430,44 @@ public class IncrementalState {
                 oldSources.remove(typeName);
             }
         }
-        indexDepsFor(typeName, newInfo);
+        // Add new entries
+        indexDepsFor(typeName, null, newInfo);
     }
 
-    private void indexDepsFor(String typeName, TypeInfo info) {
+    /**
+     * Indexes dependency edges for {@code typeName} from {@code info}.
+     * Pass {@code null} for {@code info} to skip (no-op, used during removal).
+     */
+    private void indexDepsFor(String typeName, Object unused, TypeInfo info) {
         if (info == null) {
             return;
         }
-        for (String dep : info.classDeps()) {
-            consumersIndex.computeIfAbsent(dep, k -> new TreeSet<>()).add(typeName);
+        // For GraphTypeInfo: all classDeps go into the signatureConsumersIndex (single index).
+        // For AbiTypeInfo: signatureDeps go into signatureConsumersIndex,
+        //                  implementationDeps go into implementationConsumersIndex.
+        Set<String> sigDeps;
+        if (info instanceof AbiTypeInfo abi) {
+            sigDeps = abi.signatureDeps();
+        } else {
+            sigDeps = info.classDeps();
+        }
+        for (String dep : sigDeps) {
+            signatureConsumersIndex.computeIfAbsent(dep, k -> new TreeSet<>()).add(typeName);
+        }
+        if (info instanceof AbiTypeInfo abi) {
+            for (String dep : abi.implementationDeps()) {
+                implementationConsumersIndex.computeIfAbsent(dep, k -> new TreeSet<>()).add(typeName);
+            }
         }
         sourceToTypesIndex.computeIfAbsent(info.sourceFile(), k -> new TreeSet<>()).add(typeName);
+    }
+
+    /** Returns the set of deps used for the signatureConsumersIndex for a given TypeInfo. */
+    private static Set<String> depsForIndex(TypeInfo info) {
+        if (info instanceof AbiTypeInfo abi) {
+            return abi.signatureDeps();
+        }
+        return info.classDeps();
     }
 
     // -----------------------------------------------------------------------
@@ -316,12 +487,26 @@ public class IncrementalState {
             }
             out.writeInt(types.size());
             for (var entry : types.entrySet()) {
+                String name = entry.getKey();
                 TypeInfo info = entry.getValue();
-                out.writeUTF(entry.getKey());
-                out.writeUTF(info.sourceFile());
-                writeStringSet(out, info.classDeps());
-                writeStringSet(out, info.annotationTypes());
-                out.writeUTF(info.moduleName());
+                out.writeUTF(name);
+                if (info instanceof AbiTypeInfo a) {
+                    out.writeByte(TAG_ABI);
+                    out.writeUTF(a.sourceFile());
+                    writeStringSet(out, a.classDeps());
+                    writeStringSet(out, a.annotationTypes());
+                    out.writeUTF(a.moduleName());
+                    writeStringSet(out, a.signatureDeps());
+                    writeStringSet(out, a.implementationDeps());
+                    out.writeUTF(a.abiFingerprint());
+                } else {
+                    GraphTypeInfo g = (GraphTypeInfo) info;
+                    out.writeByte(TAG_GRAPH);
+                    out.writeUTF(g.sourceFile());
+                    writeStringSet(out, g.classDeps());
+                    writeStringSet(out, g.annotationTypes());
+                    out.writeUTF(g.moduleName());
+                }
             }
             writeStringMap(out, externalFingerprints);
             writeStringMap(out, classpathIdentities);
@@ -353,11 +538,45 @@ public class IncrementalState {
             int typeCount = in.readInt();
             for (int i = 0; i < typeCount; i++) {
                 String name = in.readUTF();
-                String sourceFile = in.readUTF();
-                Set<String> classDeps = readStringSet(in);
-                Set<String> annotTypes = readStringSet(in);
-                String moduleName = in.readUTF();
-                state.types.put(name, new TypeInfo(sourceFile, classDeps, annotTypes, moduleName));
+                if (version == 1) {
+                    // Legacy format (VERSION 1): all entries were AbiTypeInfo-equivalent
+                    String sourceFile = in.readUTF();
+                    String abi = in.readUTF();
+                    Set<String> sigDeps = readStringSet(in);
+                    Set<String> implDeps = readStringSet(in);
+                    Set<String> annotTypes = readStringSet(in);
+                    String moduleName = in.readUTF();
+                    // Reconstruct classDeps as union of sig+impl (best effort for migration)
+                    var classDeps = new TreeSet<String>();
+                    classDeps.addAll(sigDeps);
+                    classDeps.addAll(implDeps);
+                    state.types.put(
+                            name,
+                            new AbiTypeInfo(
+                                    sourceFile,
+                                    Set.copyOf(classDeps),
+                                    annotTypes,
+                                    moduleName,
+                                    sigDeps,
+                                    implDeps,
+                                    abi));
+                } else {
+                    byte tag = in.readByte();
+                    String sourceFile = in.readUTF();
+                    Set<String> classDeps = readStringSet(in);
+                    Set<String> annotTypes = readStringSet(in);
+                    String moduleName = in.readUTF();
+                    if (tag == TAG_GRAPH) {
+                        state.types.put(name, new GraphTypeInfo(sourceFile, classDeps, annotTypes, moduleName));
+                    } else {
+                        // TAG_ABI
+                        Set<String> sigDeps = readStringSet(in);
+                        Set<String> implDeps = readStringSet(in);
+                        String abi = in.readUTF();
+                        state.types.put(
+                                name, new AbiTypeInfo(sourceFile, classDeps, annotTypes, moduleName, sigDeps, implDeps, abi));
+                    }
+                }
             }
             readStringMap(in, state.externalFingerprints);
             readStringMap(in, state.classpathIdentities);

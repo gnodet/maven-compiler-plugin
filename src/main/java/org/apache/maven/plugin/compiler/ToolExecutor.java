@@ -974,7 +974,7 @@ public class ToolExecutor {
         }
 
         // Enable ABI tracking when the abi strategy is selected
-        // (reserved for future PR)
+        graphBuild.setAbiTracking("abi".equalsIgnoreCase(mojo.incrementalStrategy));
 
         // Hash module-info-patch.maven files for config change detection
         graphBuild.setConfigHash(computeConfigHash(configuration));

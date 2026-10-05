@@ -701,6 +701,10 @@ public abstract class AbstractCompilerMojo implements Mojo {
      *       not use {@code staleMillis}, {@code incrementalExcludes}, or the
      *       {@link #incrementalCompilation} aspects. Setting {@link #useIncrementalCompilation}
      *       to {@code false} disables this strategy and forces a full rebuild.</p></li>
+     *   <li>{@code abi} — ABI-fingerprint-based strategy. Tracks class-level dependencies
+     *       and public API surface (ABI) fingerprints via bytecode analysis. When a source file
+     *       changes, only files whose ABI actually changed cascade to their consumers; body-only
+     *       changes recompile only the changed file. Accepted as an alias for {@code graph}.</li>
      * </ul>
      *
      * @since 4.0.0-beta-7
@@ -1425,7 +1429,7 @@ public abstract class AbstractCompilerMojo implements Mojo {
     @SuppressWarnings("UseSpecificCatch")
     private void compile(final JavaCompiler compiler, final Options configuration) throws IOException {
         var executor = createExecutor(null);
-        if ("graph".equalsIgnoreCase(incrementalStrategy)
+        if (("graph".equalsIgnoreCase(incrementalStrategy) || "abi".equalsIgnoreCase(incrementalStrategy))
                 && !Boolean.FALSE.equals(useIncrementalCompilation)) {
             if (!BytecodeAnalyzer.isAvailable()) {
                 logger.warn("Graph/ABI incremental strategy requires JDK 24 or later "

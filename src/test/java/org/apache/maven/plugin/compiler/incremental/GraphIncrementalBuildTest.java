@@ -70,11 +70,16 @@ class GraphIncrementalBuildTest {
     }
 
     private void doFullBuildCycle() throws Exception {
-        doFullBuildCycle(false);
+        doFullBuildCycle(false, false);
     }
 
     private void doFullBuildCycle(boolean modular) throws Exception {
+        doFullBuildCycle(modular, false);
+    }
+
+    private void doFullBuildCycle(boolean modular, boolean abiTracking) throws Exception {
         var build = new GraphIncrementalBuild(classesDir);
+        build.setAbiTracking(abiTracking);
         List<Path> allFiles = listSources();
         Set<Path> toCompile = build.initialize(allFiles);
 
@@ -618,5 +623,99 @@ class GraphIncrementalBuildTest {
         abi3.setConfigHash("xyz");
         abi3.initialize(listSources());
         assertTrue(abi3.isFullBuild(), "Changed configHash should trigger full rebuild");
+    }
+
+    @Test
+    void finishWritesAbiManifest() throws Exception {
+        doFullBuildCycle(false, true);
+
+        // Manifest should be written to the build directory (parent of classes/)
+        Path manifest = workDir.resolve("target/" + AbiManifest.FILENAME);
+        assertTrue(Files.exists(manifest), "ABI manifest should be written by finish()");
+
+        var fingerprints = AbiManifest.read(manifest);
+        assertFalse(fingerprints.isEmpty(), "Manifest should contain fingerprints");
+        // All three types should be in the manifest
+        assertTrue(fingerprints.containsKey("api.Model"), "Manifest should contain api.Model");
+        assertTrue(fingerprints.containsKey("impl.Helper"), "Manifest should contain impl.Helper");
+        assertTrue(fingerprints.containsKey("impl.Service"), "Manifest should contain impl.Service");
+    }
+
+    @Test
+    void crossModuleAbiChangeInvalidatesConsumers() throws Exception {
+        // Simulate two modules: "upstream" (api.Model) and "downstream" (impl.Service uses api.Model)
+        // Set up upstream module
+        Path upstreamTarget = workDir.resolve("upstream/target");
+        Path upstreamClasses = upstreamTarget.resolve("classes");
+        Path upstreamSrc = workDir.resolve("upstream/src");
+        Files.createDirectories(upstreamClasses);
+        Files.createDirectories(upstreamSrc.resolve("api"));
+
+        CompilerTestHelper.writeSource(
+                upstreamSrc, "api", "Model", "package api; public class Model { public String get() { return \"\"; } }");
+
+        // Build upstream
+        List<Path> upstreamFiles = List.of(upstreamSrc.resolve("api/Model.java"));
+        var upBuild1 = new GraphIncrementalBuild(upstreamClasses);
+        upBuild1.setAbiTracking(true);
+        Set<Path> upCompile1 = upBuild1.initialize(upstreamFiles);
+        CompilerTestHelper.compileFiles(upstreamClasses, upCompile1);
+        upBuild1.processCompiledClasses(upCompile1);
+        upBuild1.finish();
+
+        // Manifest must exist after upstream build
+        Path upManifest = upstreamTarget.resolve(AbiManifest.FILENAME);
+        assertTrue(Files.exists(upManifest), "Upstream manifest should be written");
+        assertTrue(AbiManifest.read(upManifest).containsKey("api.Model"), "Manifest should contain api.Model");
+
+        // Set up downstream module using upstream's classes dir on its classpath
+        Path downstreamTarget = workDir.resolve("downstream/target");
+        Path downstreamClasses = downstreamTarget.resolve("classes");
+        Path downstreamSrc = workDir.resolve("downstream/src");
+        Files.createDirectories(downstreamClasses);
+        Files.createDirectories(downstreamSrc.resolve("impl"));
+
+        CompilerTestHelper.writeSource(
+                downstreamSrc,
+                "impl",
+                "Service",
+                "package impl; import api.Model; public class Service { public Model build() { return new Model(); } }");
+
+        List<Path> downstreamFiles = List.of(downstreamSrc.resolve("impl/Service.java"));
+        var downBuild1 = new GraphIncrementalBuild(downstreamClasses);
+        downBuild1.setAbiTracking(true);
+        downBuild1.setClasspathEntries(List.of(upstreamClasses));
+        downBuild1.setReactorModulePaths(Set.of(upstreamClasses));
+        Set<Path> downCompile1 = downBuild1.initialize(downstreamFiles);
+        CompilerTestHelper.compileFiles(downstreamClasses, downCompile1, upstreamClasses);
+        downBuild1.processCompiledClasses(downCompile1);
+        downBuild1.finish();
+
+        // Now change upstream's api.Model ABI (add a method)
+        CompilerTestHelper.writeSource(
+                upstreamSrc, "api", "Model", "package api; public class Model { public String get() { return \"\"; } public int size() { return 0; } }");
+
+        var upBuild2 = new GraphIncrementalBuild(upstreamClasses);
+        upBuild2.setAbiTracking(true);
+        Set<Path> upCompile2 = upBuild2.initialize(upstreamFiles);
+        assertFalse(upCompile2.isEmpty(), "Upstream should recompile Model");
+        CompilerTestHelper.compileFiles(upstreamClasses, upCompile2);
+        upBuild2.processCompiledClasses(upCompile2);
+        upBuild2.finish();
+
+        // Manifest should be updated with new fingerprint
+        var newFingerprints = AbiManifest.read(upManifest);
+        assertFalse(newFingerprints.isEmpty(), "Updated manifest should be non-empty");
+
+        // Downstream should detect the ABI change and recompile Service
+        var downBuild2 = new GraphIncrementalBuild(downstreamClasses);
+        downBuild2.setAbiTracking(true);
+        downBuild2.setClasspathEntries(List.of(upstreamClasses));
+        downBuild2.setReactorModulePaths(Set.of(upstreamClasses));
+        Set<Path> downCompile2 = downBuild2.initialize(downstreamFiles);
+        assertFalse(downCompile2.isEmpty(), "Downstream should be invalidated by upstream ABI change");
+        assertTrue(
+                downCompile2.contains(downstreamSrc.resolve("impl/Service.java")),
+                "Service.java should be scheduled for recompilation");
     }
 }
